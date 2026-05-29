@@ -93,9 +93,11 @@ struct ContentView: View {
     @State private var showingRenamePrompt = false
     @State private var renameDraft = ""
     @State private var collapsedHistorySections: Set<String> = []
+    @State private var isAttachmentMenuPresented = false
     @AppStorage("aida-theme-appearance") private var themeAppearanceRaw = ThemeAppearanceOption.system.rawValue
     @AppStorage("aida-accent-color") private var accentColorRaw = AccentColorOption.defaultTone.rawValue
     @AppStorage("aida-personality-preset") private var personalityPreset = "Default"
+    @AppStorage("aida-custom-personality-instructions") private var customPersonalityInstructions = ""
 
     var body: some View {
         NavigationStack {
@@ -132,14 +134,18 @@ struct ContentView: View {
             .tint(appAccentColor)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.22)) {
-                            isSideMenuPresented.toggle()
+                    Group {
+                        if !isSideMenuPresented {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.22)) {
+                                    isSideMenuPresented.toggle()
+                                }
+                            } label: {
+                                menuButtonIcon
+                            }
+                            .accessibilityLabel("Open menu")
                         }
-                    } label: {
-                        menuButtonIcon
                     }
-                    .accessibilityLabel("Open menu")
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
@@ -153,6 +159,7 @@ struct ContentView: View {
             SettingsView(
                 viewModel: viewModel,
                 personalityPreset: $personalityPreset,
+                customPersonalityInstructions: $customPersonalityInstructions,
                 themeAppearance: Binding(
                     get: { themeAppearance },
                     set: { themeAppearanceRaw = $0.rawValue }
@@ -292,63 +299,69 @@ struct ContentView: View {
     }
 
     private var sideMenu: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 8) {
-                Text("Aida")
-                Text("\u{2728}")
-            }
-            .font(.title.weight(.bold))
+        GeometryReader { proxy in
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 8) {
+                    Text("Aida")
+                        .font(.title.weight(.bold))
+                    Image(systemName: "sparkles")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(appAccentColor)
+                    Spacer(minLength: 0)
+                }
 
-            VStack(alignment: .leading, spacing: 12) {
-                ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 14) {
-                        ForEach(historySections) { section in
-                            VStack(alignment: .leading, spacing: 8) {
-                                historySectionHeader(section)
+                VStack(alignment: .leading, spacing: 12) {
+                    ScrollView(showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 14) {
+                            ForEach(historySections) { section in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    historySectionHeader(section)
 
-                                if !collapsedHistorySections.contains(section.id) {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        ForEach(section.chats) { chat in
-                                            chatRow(chat)
+                                    if !collapsedHistorySections.contains(section.id) {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            ForEach(section.chats) { chat in
+                                                chatRow(chat)
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        .padding(.bottom, 16)
                     }
-                    .padding(.bottom, 16)
                 }
-            }
-
-            Spacer(minLength: 0)
-
-            HStack {
-                Button {
-                    isSideMenuPresented = false
-                    viewModel.showingSettings = true
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .frame(width: 42, height: 42)
-                        .background(
-                            Circle()
-                                .fill(Color(.tertiarySystemFill))
-                        )
-                        .foregroundStyle(.primary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Settings")
 
                 Spacer()
+
+                HStack {
+                    Button {
+                        isSideMenuPresented = false
+                        viewModel.showingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .frame(width: 42, height: 42)
+                            .background(
+                                Circle()
+                                    .fill(Color(.tertiarySystemFill))
+                            )
+                            .foregroundStyle(.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Settings")
+
+                    Spacer()
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, proxy.safeAreaInsets.top + 60)
+            .padding(.bottom, 20)
+            .frame(width: 280, height: proxy.size.height, alignment: .topLeading)
+            .background(Color(.secondarySystemBackground))
+            .shadow(color: .black.opacity(0.14), radius: 20, x: 8, y: 0)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 20)
-        .padding(.bottom, 20)
         .frame(width: 280)
-        .frame(maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(.secondarySystemBackground))
-        .shadow(color: .black.opacity(0.14), radius: 20, x: 8, y: 0)
+        .ignoresSafeArea(edges: .top)
     }
 
     private var historySections: [ChatHistorySection] {
@@ -494,6 +507,9 @@ struct ContentView: View {
                 }
                 .padding()
             }
+            .onTapGesture {
+                dismissAttachmentMenu()
+            }
             .onChange(of: viewModel.messages) { _, messages in
                 guard let lastID = messages.last?.id else { return }
                 withAnimation {
@@ -530,6 +546,11 @@ struct ContentView: View {
                     .padding(.bottom, 10)
                     .focused($inputFocused)
                     .lineLimit(3 ... 8)
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            dismissAttachmentMenu()
+                        }
+                    )
 
                 HStack(alignment: .center, spacing: 12) {
                     HStack(spacing: 10) {
@@ -610,6 +631,14 @@ struct ContentView: View {
         }
     }
 
+    private func dismissAttachmentMenu() {
+        guard isAttachmentMenuPresented else { return }
+
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+            isAttachmentMenuPresented = false
+        }
+    }
+
     private func toastView(message: String) -> some View {
         VStack {
             Spacer()
@@ -659,10 +688,16 @@ struct ContentView: View {
                     .fill(Color(.tertiarySystemFill))
             )
         }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                dismissAttachmentMenu()
+            }
+        )
     }
 
     private var webSearchButton: some View {
         Button {
+            dismissAttachmentMenu()
             viewModel.isWebSearchEnabled.toggle()
         } label: {
             Image(systemName: "globe")
@@ -679,18 +714,84 @@ struct ContentView: View {
     }
 
     private var plusAccessory: some View {
-        Image(systemName: "plus")
-            .font(.subheadline.weight(.semibold))
-            .frame(width: 28, height: 28)
-            .background(
-                Circle()
-                    .fill(Color(.tertiarySystemFill))
-            )
-            .foregroundStyle(.primary)
+        Button {
+            inputFocused = false
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                isAttachmentMenuPresented.toggle()
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.subheadline.weight(.semibold))
+                .rotationEffect(.degrees(isAttachmentMenuPresented ? 45 : 0))
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle()
+                        .fill(Color(.tertiarySystemFill))
+                )
+                .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .bottomLeading) {
+            if isAttachmentMenuPresented {
+                attachmentMenu
+                    .offset(x: -4, y: -30)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .zIndex(isAttachmentMenuPresented ? 1 : 0)
+        .accessibilityLabel("Open attachments")
+    }
+
+    private var attachmentMenu: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            attachmentMenuButton(title: "Camera", systemImage: "camera")
+            attachmentMenuButton(title: "Photos", systemImage: "photo.on.rectangle")
+            attachmentMenuButton(title: "Files", systemImage: "doc")
+            attachmentMenuButton(title: "URL", systemImage: "link")
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(.secondarySystemBackground).opacity(0.96))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 10)
+    }
+
+    private func attachmentMenuButton(title: String, systemImage: String) -> some View {
+        Button {
+            dismissAttachmentMenu()
+            presentToast("\(title) coming soon")
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .font(.headline.weight(.semibold))
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(Color(.tertiarySystemFill))
+                    )
+
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .frame(width: 170, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var micButton: some View {
         Button {
+            dismissAttachmentMenu()
             Task {
                 if speechInput.isRecording {
                     speechInput.stopRecording()
@@ -715,6 +816,7 @@ struct ContentView: View {
 
     private var sendButton: some View {
         Button {
+            dismissAttachmentMenu()
             if viewModel.isSending {
                 viewModel.stopStreaming()
             } else {
@@ -911,6 +1013,7 @@ private struct MessageBubble: View {
 private struct SettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
     @Binding var personalityPreset: String
+    @Binding var customPersonalityInstructions: String
     @Binding var themeAppearance: ThemeAppearanceOption
     @Binding var accentColor: AccentColorOption
     @Environment(\.dismiss) private var dismiss
@@ -920,7 +1023,8 @@ private struct SettingsView: View {
         "Friendly",
         "Creative",
         "Professional",
-        "Playful"
+        "Playful",
+        "Custom"
     ]
 
     var body: some View {
@@ -1010,6 +1114,28 @@ private struct SettingsView: View {
                                 )
                             }
                             .buttonStyle(.plain)
+
+                            if personalityPreset == "Custom" {
+                                settingsDivider
+
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("Custom instructions")
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.secondary)
+
+                                    TextEditor(text: $customPersonalityInstructions)
+                                        .frame(minHeight: 110)
+                                        .scrollContentBackground(.hidden)
+                                        .padding(10)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                .fill(Color(.tertiarySystemFill))
+                                        )
+                                }
+                                .padding(.horizontal, 18)
+                                .padding(.top, 16)
+                                .padding(.bottom, 18)
+                            }
                         }
                     }
 

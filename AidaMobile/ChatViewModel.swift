@@ -70,6 +70,8 @@ final class ChatViewModel: ObservableObject {
         static let apiToken = "native-api-token"
         static let savedChats = "native-saved-chats"
         static let currentChatID = "native-current-chat-id"
+        static let personalityPreset = "aida-personality-preset"
+        static let customPersonalityInstructions = "aida-custom-personality-instructions"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -336,6 +338,15 @@ final class ChatViewModel: ObservableObject {
     ) -> [AidaMessagePayload] {
         var history: [AidaMessagePayload] = []
 
+        if let personalityInstruction = personalityInstruction() {
+            history.append(
+                AidaMessagePayload(
+                    type: "human",
+                    content: personalityInstruction
+                )
+            )
+        }
+
         if webSearchEnabled {
             history.append(
                 AidaMessagePayload(
@@ -359,6 +370,29 @@ final class ChatViewModel: ObservableObject {
         )
 
         return history
+    }
+
+    private func personalityInstruction() -> String? {
+        let preset = defaults.string(forKey: Keys.personalityPreset) ?? "Default"
+
+        switch preset {
+        case "Friendly":
+            return "Respond in a warm, friendly, approachable tone while staying helpful and clear."
+        case "Creative":
+            return "Respond with a more imaginative, expressive, and creative tone while still being useful."
+        case "Professional":
+            return "Respond in a polished, professional, concise tone with clear structure."
+        case "Playful":
+            return "Respond in a playful, light, upbeat tone while staying helpful and easy to follow."
+        case "Custom":
+            let customInstructions = trimmed(
+                defaults.string(forKey: Keys.customPersonalityInstructions) ?? ""
+            )
+            guard !customInstructions.isEmpty else { return nil }
+            return "Follow these personality instructions for all assistant responses in this chat: \(customInstructions)"
+        default:
+            return nil
+        }
     }
 
     private func ensureCurrentChatIfNeeded(withFirstUserMessage firstMessage: String) {
