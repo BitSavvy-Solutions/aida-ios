@@ -13,6 +13,7 @@ final class SpeechInputManager: NSObject, ObservableObject {
     private let speechRecognizer = SFSpeechRecognizer()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var activeRecognitionSessionID = UUID()
 
     func startRecording() async {
         errorMessage = nil
@@ -40,6 +41,7 @@ final class SpeechInputManager: NSObject, ObservableObject {
     }
 
     func stopRecording() {
+        activeRecognitionSessionID = UUID()
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
@@ -82,6 +84,8 @@ final class SpeechInputManager: NSObject, ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         recognitionRequest = request
+        let sessionID = UUID()
+        activeRecognitionSessionID = sessionID
 
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
@@ -96,17 +100,17 @@ final class SpeechInputManager: NSObject, ObservableObject {
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
 
-            if let result {
-                Task { @MainActor in
+            Task { @MainActor in
+                guard self.activeRecognitionSessionID == sessionID else { return }
+
+                if let result {
                     self.transcript = result.bestTranscription.formattedString
                     if result.isFinal {
                         self.stopRecording()
                     }
                 }
-            }
 
-            if let error {
-                Task { @MainActor in
+                if let error {
                     self.errorMessage = error.localizedDescription
                     self.stopRecording()
                 }

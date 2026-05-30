@@ -101,6 +101,8 @@ final class ChatViewModel: ObservableObject {
 
     private let client = AidaAPIClient()
     private var currentStreamTask: Task<Void, Never>?
+    private var activeStreamSessionID = UUID()
+    private var activeStreamingAssistantMessageID: UUID?
     private let defaults: UserDefaults
 
     private enum Keys {
@@ -236,7 +238,39 @@ final class ChatViewModel: ObservableObject {
         return true
     }
 
+    @discardableResult
+    func regenerateFromUserMessage(messageID: UUID) -> Bool {
+        guard hasRequiredIdentity else {
+            errorMessage = "Enter your email and either a user ID or API token in Settings."
+            showingSettings = true
+            return false
+        }
+
+        guard let userIndex = messages.firstIndex(where: { $0.id == messageID && $0.role == .user }) else {
+            return false
+        }
+
+        stopStreaming()
+
+        let removalStartIndex = messages.index(after: userIndex)
+        if removalStartIndex < messages.endIndex {
+            messages.removeSubrange(removalStartIndex...)
+        }
+
+        errorMessage = nil
+        editingMessageID = nil
+        syncCurrentChat()
+
+        startAssistantResponse()
+        return true
+    }
+
     func stopStreaming() {
+        activeStreamSessionID = UUID()
+        if let assistantMessageID = activeStreamingAssistantMessageID {
+            removeAssistantPlaceholderIfEmpty(id: assistantMessageID)
+        }
+        activeStreamingAssistantMessageID = nil
         currentStreamTask?.cancel()
         currentStreamTask = nil
         isSending = false
@@ -478,6 +512,7 @@ final class ChatViewModel: ObservableObject {
 
     private func startAssistantResponse() {
         let assistantID = UUID()
+        let streamSessionID = UUID()
         messages.append(ChatMessage(id: assistantID, role: .assistant, text: ""))
         syncCurrentChat()
 
@@ -506,6 +541,8 @@ final class ChatViewModel: ObservableObject {
 
         isSending = true
         isWebSearchEnabled = false
+        activeStreamSessionID = streamSessionID
+        activeStreamingAssistantMessageID = assistantID
         currentStreamTask?.cancel()
         currentStreamTask = Task { [weak self] in
             guard let self else { return }
@@ -513,22 +550,32 @@ final class ChatViewModel: ObservableObject {
             do {
                 try await client.streamChat(payload: payload, apiToken: apiToken.isEmpty ? nil : apiToken) { [weak self] event in
                     guard let self else { return }
+                    guard self.activeStreamSessionID == streamSessionID else { return }
                     if let delta = event.assistantTextDelta, !delta.isEmpty {
                         self.append(delta, toAssistantMessageWithID: assistantID)
                     }
                 }
 
+                guard activeStreamSessionID == streamSessionID else { return }
                 if let index = messages.firstIndex(where: { $0.id == assistantID }), messages[index].text.isEmpty {
                     messages[index].text = "No response received."
                     syncCurrentChat()
                 }
             } catch is CancellationError {
+                guard activeStreamSessionID == streamSessionID else { return }
                 removeAssistantPlaceholderIfEmpty(id: assistantID)
             } catch {
+                guard activeStreamSessionID == streamSessionID else { return }
                 removeAssistantPlaceholderIfEmpty(id: assistantID)
-                errorMessage = error.localizedDescription
+
+                if !isExpectedStreamCancellation(error) {
+                    errorMessage = error.localizedDescription
+                }
             }
 
+            guard activeStreamSessionID == streamSessionID else { return }
+            activeStreamingAssistantMessageID = nil
+            currentStreamTask = nil
             isSending = false
         }
     }
@@ -545,6 +592,15 @@ final class ChatViewModel: ObservableObject {
             messages.remove(at: index)
             syncCurrentChat()
         }
+    }
+
+    private func isExpectedStreamCancellation(_ error: Error) -> Bool {
+        if error is CancellationError || Task.isCancelled {
+            return true
+        }
+
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
     }
 
     private func trimmed(_ value: String) -> String {

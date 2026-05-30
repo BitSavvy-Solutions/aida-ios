@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -87,6 +88,7 @@ private enum AccentColorOption: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @StateObject private var viewModel = ChatViewModel()
     @StateObject private var speechInput = SpeechInputManager()
+    @StateObject private var assistantSpeech = AssistantSpeechManager()
     @Environment(\.colorScheme) private var systemColorScheme
     @FocusState private var inputFocused: Bool
     @State private var draftBeforeRecording = ""
@@ -773,6 +775,13 @@ struct ContentView: View {
                                 guard viewModel.beginEditing(messageID: message.id) else { return }
                                 inputFocused = true
                             },
+                            onRegenerateUserMessage: {
+                                _ = viewModel.regenerateFromUserMessage(messageID: message.id)
+                            },
+                            onSpeakAssistantMessage: {
+                                assistantSpeech.toggleSpeech(for: message)
+                            },
+                            isSpeakingAssistantMessage: assistantSpeech.speakingMessageID == message.id,
                             onRegenerateAssistantMessage: {
                                 _ = viewModel.regenerateAssistantMessage(messageID: message.id)
                             },
@@ -2331,6 +2340,9 @@ private struct MessageBubble: View {
     let message: ChatMessage
     let onCopyUserMessage: () -> Void
     let onEditUserMessage: () -> Void
+    let onRegenerateUserMessage: () -> Void
+    let onSpeakAssistantMessage: () -> Void
+    let isSpeakingAssistantMessage: Bool
     let onRegenerateAssistantMessage: () -> Void
     let accentColor: Color
     @State private var copied = false
@@ -2377,6 +2389,16 @@ private struct MessageBubble: View {
                     onEditUserMessage()
                 } label: {
                     Label("Edit", systemImage: "pencil")
+                }
+
+                Button {
+                    onRegenerateUserMessage()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.clockwise")
+                        Image(systemName: "sparkles")
+                        Text("Regenerate")
+                    }
                 }
             }
     }
@@ -2443,8 +2465,89 @@ private struct MessageBubble: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Regenerate")
+
+                Button {
+                    onSpeakAssistantMessage()
+                } label: {
+                    Image(systemName: isSpeakingAssistantMessage ? "speaker.wave.2.fill" : "speaker.wave.2")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isSpeakingAssistantMessage ? .blue : .secondary)
+                .accessibilityLabel(isSpeakingAssistantMessage ? "Stop reading aloud" : "Read aloud")
             }
         }
+    }
+}
+
+private final class AssistantSpeechManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
+    @Published private(set) var speakingMessageID: UUID?
+
+    private let synthesizer = AVSpeechSynthesizer()
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    func toggleSpeech(for message: ChatMessage) {
+        let text = speechText(from: message.text)
+        guard !text.isEmpty else { return }
+
+        if speakingMessageID == message.id && synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+            speakingMessageID = nil
+            return
+        }
+
+        if synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+        }
+
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = preferredVoice()
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        utterance.prefersAssistiveTechnologySettings = true
+
+        speakingMessageID = message.id
+        synthesizer.speak(utterance)
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor in
+            self.speakingMessageID = nil
+        }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor in
+            self.speakingMessageID = nil
+        }
+    }
+
+    private func preferredVoice() -> AVSpeechSynthesisVoice? {
+        for language in Locale.preferredLanguages {
+            if let voice = AVSpeechSynthesisVoice(language: language) {
+                return voice
+            }
+        }
+
+        return AVSpeechSynthesisVoice(language: "en-US")
+    }
+
+    private func speechText(from rawText: String) -> String {
+        rawText
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: #"```"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?m)^#{1,6}\s*"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?m)^[-*+]\s+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?m)^\d+\.\s+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"`([^`]*)`"#, with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: #"\*\*(.*?)\*\*"#, with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: #"\*(.*?)\*"#, with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: #"\n{2,}"#, with: ". ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
