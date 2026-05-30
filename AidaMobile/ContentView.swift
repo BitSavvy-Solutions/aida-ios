@@ -1,5 +1,8 @@
+import AVFoundation
+import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 private enum ThemeAppearanceOption: String, CaseIterable, Identifiable {
     case system
@@ -91,9 +94,19 @@ struct ContentView: View {
     @State private var toastMessage: String?
     @State private var toastDismissTask: Task<Void, Never>?
     @State private var showingRenamePrompt = false
+    @State private var showingNewProjectSheet = false
+    @State private var showingProjectEditor = false
     @State private var renameDraft = ""
+    @State private var renameTargetChatID: UUID?
+    @State private var editingProjectID: UUID?
     @State private var collapsedHistorySections: Set<String> = []
+    @State private var knownProjectCollapseKeys: Set<String> = []
+    @State private var hoveredProjectDropID: UUID?
     @State private var isAttachmentMenuPresented = false
+    @State private var isCameraPresented = false
+    @State private var isPhotoPickerPresented = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var isImportingPhotos = false
     @AppStorage("aida-theme-appearance") private var themeAppearanceRaw = ThemeAppearanceOption.system.rawValue
     @AppStorage("aida-accent-color") private var accentColorRaw = AccentColorOption.defaultTone.rawValue
     @AppStorage("aida-personality-preset") private var personalityPreset = "Default"
@@ -170,6 +183,50 @@ struct ContentView: View {
                 )
             )
         }
+        .sheet(isPresented: $showingNewProjectSheet) {
+            NewProjectSheet(accentColor: appAccentColor) { title, iconSystemName, iconColorName in
+                viewModel.createProject(
+                    title: title,
+                    iconSystemName: iconSystemName,
+                    iconColorName: iconColorName
+                )
+            }
+        }
+        .sheet(isPresented: $showingProjectEditor, onDismiss: {
+            editingProjectID = nil
+        }) {
+            if let editingProjectID,
+               let project = viewModel.project(for: editingProjectID) {
+                EditProjectSheet(
+                    project: project,
+                    projectChats: viewModel.chats(inProjectID: project.id),
+                    accentColor: appAccentColor,
+                    onSave: { title, iconSystemName, iconColorName in
+                        viewModel.updateProject(
+                            id: project.id,
+                            title: title,
+                            iconSystemName: iconSystemName,
+                            iconColorName: iconColorName
+                        )
+                    },
+                    onRemoveChat: { chatID in
+                        viewModel.assignChat(id: chatID, toProjectID: nil)
+                    }
+                )
+            } else {
+                Color.clear
+                    .presentationDetents([.height(1)])
+                    .onAppear {
+                        showingProjectEditor = false
+                }
+            }
+        }
+        .fullScreenCover(isPresented: $isCameraPresented) {
+            CameraCaptureView(isPresented: $isCameraPresented) { image in
+                importCapturedPhoto(image)
+            }
+            .ignoresSafeArea()
+        }
         .onChange(of: speechInput.transcript) { _, newValue in
             let base = draftBeforeRecording.trimmingCharacters(in: .whitespacesAndNewlines)
             let partial = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -180,6 +237,19 @@ struct ContentView: View {
                 viewModel.draft = partial
             } else {
                 viewModel.draft = "\(base) \(partial)"
+            }
+        }
+        .onAppear {
+            syncProjectCollapseState(with: viewModel.savedProjects)
+        }
+        .onChange(of: viewModel.savedProjects) { _, projects in
+            syncProjectCollapseState(with: projects)
+        }
+        .onChange(of: selectedPhotoItems) { _, items in
+            guard !items.isEmpty else { return }
+
+            Task {
+                await importSelectedPhotos(items)
             }
         }
         .alert("Error", isPresented: Binding(
@@ -201,15 +271,27 @@ struct ContentView: View {
         .alert("Rename Chat", isPresented: $showingRenamePrompt) {
             TextField("Chat name", text: $renameDraft)
 
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) {
+                renameTargetChatID = nil
+            }
 
             Button("Save") {
-                viewModel.renameCurrentChat(to: renameDraft)
+                if let renameTargetChatID {
+                    viewModel.renameChat(id: renameTargetChatID, to: renameDraft)
+                }
+                renameTargetChatID = nil
             }
             .disabled(renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: {
             Text("Choose a new name for this chat.")
         }
+        .photosPicker(
+            isPresented: $isPhotoPickerPresented,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: nil,
+            matching: .images,
+            preferredItemEncoding: .automatic
+        )
     }
 
     private var themeAppearance: ThemeAppearanceOption {
@@ -266,13 +348,18 @@ struct ContentView: View {
                         .frame(width: 1, height: 18)
 
                     Menu {
-                        Button("Rename") {
+                        Button {
                             renameDraft = viewModel.currentChatTitle
+                            renameTargetChatID = viewModel.currentChatID
                             showingRenamePrompt = true
+                        } label: {
+                            Label("Rename Chat", systemImage: "pencil")
                         }
 
-                        Button("Delete", role: .destructive) {
+                        Button(role: .destructive) {
                             viewModel.deleteCurrentChat()
+                        } label: {
+                            destructiveTrashMenuLabel("Delete Chat")
                         }
                     } label: {
                         Image(systemName: "ellipsis")
@@ -312,7 +399,9 @@ struct ContentView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     ScrollView(showsIndicators: false) {
-                        VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 22) {
+                            projectsSection
+
                             ForEach(historySections) { section in
                                 VStack(alignment: .leading, spacing: 8) {
                                     historySectionHeader(section)
@@ -364,8 +453,189 @@ struct ContentView: View {
         .ignoresSafeArea(edges: .top)
     }
 
+    private var projectsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Projects")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Button {
+                showingNewProjectSheet = true
+            } label: {
+                HStack(spacing: 14) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.headline.weight(.medium))
+                        .frame(width: 22)
+
+                    Text("New Project")
+                        .font(.subheadline.weight(.medium))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.primary)
+                .padding(.vertical, 2)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("New Project")
+
+            if !viewModel.savedProjects.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(viewModel.savedProjects) { project in
+                        projectRow(project)
+                    }
+                }
+                .padding(.top, 6)
+            }
+        }
+        .padding(.top, 6)
+    }
+
+    private func projectRow(_ project: SavedProject) -> some View {
+        let projectChats = viewModel.chats(inProjectID: project.id)
+        let isExpanded = collapsedHistorySections.contains(projectCollapseKey(project.id)) == false
+        let isSelected = viewModel.currentProjectID == project.id
+        let isDropTargeted = hoveredProjectDropID == project.id
+
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                if isExpanded {
+                    collapsedHistorySections.insert(projectCollapseKey(project.id))
+                } else {
+                    collapsedHistorySections.remove(projectCollapseKey(project.id))
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: project.iconSystemName)
+                        .font(.subheadline.weight(.semibold))
+                        .frame(width: 18, height: 18)
+                        .foregroundStyle(projectIconColor(named: project.iconColorName))
+
+                    Text(project.title)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+
+                    Spacer(minLength: 0)
+
+                    if !projectChats.isEmpty {
+                        Text("\(projectChats.count)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(
+                            isDropTargeted
+                                ? appAccentColor.opacity(0.22)
+                                : (isSelected ? appAccentColor.opacity(0.16) : Color(.tertiarySystemFill))
+                        )
+                )
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button {
+                    editingProjectID = project.id
+                    showingProjectEditor = true
+                } label: {
+                    Label("Edit Project", systemImage: "pencil")
+                }
+
+                Button(role: .destructive) {
+                    if editingProjectID == project.id {
+                        editingProjectID = nil
+                        showingProjectEditor = false
+                    }
+                    if viewModel.currentProjectID == project.id {
+                        collapsedHistorySections.insert(projectCollapseKey(project.id))
+                    }
+                    viewModel.deleteProject(id: project.id)
+                } label: {
+                    destructiveTrashMenuLabel("Delete Project")
+                }
+            }
+
+            if isExpanded {
+                if projectChats.isEmpty {
+                    Text("No chats yet")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 16)
+                        .padding(.top, 2)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(projectChats) { chat in
+                            projectChatRow(chat)
+                        }
+                    }
+                    .padding(.leading, 10)
+                }
+            }
+        }
+        .onDrop(
+            of: [UTType.text.identifier],
+            delegate: SidebarProjectDropDelegate(
+                projectID: project.id,
+                hoveredProjectDropID: $hoveredProjectDropID,
+                collapsedHistorySections: $collapsedHistorySections,
+                collapseKey: projectCollapseKey(project.id),
+                onAssignChat: { chatID, projectID in
+                    viewModel.assignChat(id: chatID, toProjectID: projectID)
+                }
+            )
+        )
+    }
+
+    private func projectChatRow(_ chat: SavedChat) -> some View {
+        Button {
+            viewModel.selectChat(id: chat.id)
+            withAnimation(.easeInOut(duration: 0.22)) {
+                isSideMenuPresented = false
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "message")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(viewModel.currentChatID == chat.id ? .white : .secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(chat.title)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .foregroundStyle(viewModel.currentChatID == chat.id ? .white : .primary)
+
+                    Text(historyTimeFormatter.string(from: chat.updatedAt))
+                        .font(.caption2)
+                        .foregroundStyle(viewModel.currentChatID == chat.id ? .white.opacity(0.82) : .secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(viewModel.currentChatID == chat.id ? appAccentColor : Color(.tertiarySystemFill))
+            )
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            sidebarChatContextMenu(for: chat)
+        }
+        .onDrag {
+            NSItemProvider(object: chat.id.uuidString as NSString)
+        }
+    }
+
     private var historySections: [ChatHistorySection] {
-        let chats = viewModel.savedChats
+        let chats = viewModel.savedChats.filter { $0.projectID == nil }
         guard !chats.isEmpty else { return [] }
 
         var sections: [ChatHistorySection] = []
@@ -480,6 +750,12 @@ struct ContentView: View {
             )
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            sidebarChatContextMenu(for: chat)
+        }
+        .onDrag {
+            NSItemProvider(object: chat.id.uuidString as NSString)
+        }
     }
 
     private var chatTranscript: some View {
@@ -539,10 +815,16 @@ struct ContentView: View {
                         .padding(.top, 12)
                 }
 
+                if isImportingPhotos || !viewModel.draftImageAttachments.isEmpty {
+                    draftImageTray
+                        .padding(.horizontal, 12)
+                        .padding(.top, viewModel.editingMessageID == nil ? 12 : 0)
+                }
+
                 TextField("Chat with Aida", text: $viewModel.draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .padding(.horizontal, 16)
-                    .padding(.top, viewModel.editingMessageID == nil ? 18 : 4)
+                    .padding(.top, viewModel.editingMessageID == nil && viewModel.draftImageAttachments.isEmpty && !isImportingPhotos ? 18 : 4)
                     .padding(.bottom, 10)
                     .focused($inputFocused)
                     .lineLimit(3 ... 8)
@@ -639,6 +921,88 @@ struct ContentView: View {
         }
     }
 
+    private func importSelectedPhotos(_ items: [PhotosPickerItem]) async {
+        isImportingPhotos = true
+        defer {
+            isImportingPhotos = false
+            selectedPhotoItems = []
+        }
+
+        var imports: [DraftImageImport] = []
+
+        for (index, item) in items.enumerated() {
+            guard let data = try? await item.loadTransferable(type: Data.self) else {
+                continue
+            }
+
+            let contentType = item.supportedContentTypes.first
+            let fileExtension = contentType?.preferredFilenameExtension ?? "jpg"
+
+            imports.append(
+                DraftImageImport(
+                    data: data,
+                    name: "Photo \(index + 1).\(fileExtension)"
+                )
+            )
+        }
+
+        if imports.isEmpty {
+            presentToast("Couldn't load the selected photo")
+            return
+        }
+
+        viewModel.addDraftImageImports(imports)
+        inputFocused = true
+    }
+
+    private func startCameraCapture() {
+        guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            presentToast("Camera is unavailable on this device")
+            return
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            isCameraPresented = true
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        isCameraPresented = true
+                    } else {
+                        presentToast("Allow camera access in Settings")
+                    }
+                }
+            }
+        case .denied, .restricted:
+            presentToast("Allow camera access in Settings")
+        @unknown default:
+            presentToast("Camera is unavailable right now")
+        }
+    }
+
+    private func importCapturedPhoto(_ image: UIImage) {
+        guard let data = image.jpegData(compressionQuality: 0.92) else {
+            presentToast("Couldn't process the captured photo")
+            return
+        }
+
+        let previousAttachmentCount = viewModel.draftImageAttachments.count
+        viewModel.addDraftImageImports([
+            DraftImageImport(
+                data: data,
+                name: "Camera Photo.jpg"
+            )
+        ])
+
+        guard viewModel.draftImageAttachments.count > previousAttachmentCount else {
+            presentToast("Couldn't process the captured photo")
+            return
+        }
+
+        inputFocused = true
+    }
+
     private func toastView(message: String) -> some View {
         VStack {
             Spacer()
@@ -713,6 +1077,47 @@ struct ContentView: View {
         .accessibilityLabel("Toggle web search")
     }
 
+    private var draftImageTray: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                if isImportingPhotos {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading photos…")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color(.tertiarySystemFill))
+                    )
+                }
+
+                ForEach(viewModel.draftImageAttachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        imageAttachmentThumbnail(attachment, size: CGSize(width: 92, height: 92))
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+                        Button {
+                            viewModel.removeDraftImageAttachment(id: attachment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(Color.black.opacity(0.72)))
+                        }
+                        .buttonStyle(.plain)
+                        .offset(x: 6, y: -6)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
     private var plusAccessory: some View {
         Button {
             inputFocused = false
@@ -744,10 +1149,18 @@ struct ContentView: View {
 
     private var attachmentMenu: some View {
         VStack(alignment: .leading, spacing: 10) {
-            attachmentMenuButton(title: "Camera", systemImage: "camera")
-            attachmentMenuButton(title: "Photos", systemImage: "photo.on.rectangle")
-            attachmentMenuButton(title: "Files", systemImage: "doc")
-            attachmentMenuButton(title: "URL", systemImage: "link")
+            attachmentMenuButton(title: "Camera", systemImage: "camera") {
+                startCameraCapture()
+            }
+            attachmentMenuButton(title: "Photos", systemImage: "photo.on.rectangle") {
+                isPhotoPickerPresented = true
+            }
+            attachmentMenuButton(title: "Files", systemImage: "doc") {
+                presentToast("Files coming soon")
+            }
+            attachmentMenuButton(title: "URL", systemImage: "link") {
+                presentToast("URL coming soon")
+            }
         }
         .padding(10)
         .background(
@@ -761,10 +1174,14 @@ struct ContentView: View {
         .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 10)
     }
 
-    private func attachmentMenuButton(title: String, systemImage: String) -> some View {
+    private func attachmentMenuButton(
+        title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
         Button {
             dismissAttachmentMenu()
-            presentToast("\(title) coming soon")
+            action()
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: systemImage)
@@ -838,7 +1255,661 @@ struct ContentView: View {
     }
 
     private var canSend: Bool {
-        !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && viewModel.hasRequiredIdentity
+        (
+            !viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !viewModel.draftImageAttachments.isEmpty
+        ) && viewModel.hasRequiredIdentity
+    }
+
+    private func projectCollapseKey(_ id: UUID) -> String {
+        "project-\(id.uuidString)"
+    }
+
+    private func projectIconColor(named colorName: String) -> Color {
+        ProjectIconColorOption(rawValue: colorName)?.color ?? .white
+    }
+
+    private func syncProjectCollapseState(with projects: [SavedProject]) {
+        let projectKeys = Set(projects.map { projectCollapseKey($0.id) })
+        let newKeys = projectKeys.subtracting(knownProjectCollapseKeys)
+
+        collapsedHistorySections.formUnion(newKeys)
+        collapsedHistorySections = collapsedHistorySections.intersection(projectKeys.union(nonProjectCollapsedSectionKeys))
+        knownProjectCollapseKeys = projectKeys
+    }
+
+    private var nonProjectCollapsedSectionKeys: Set<String> {
+        Set(collapsedHistorySections.filter { !$0.hasPrefix("project-") })
+    }
+
+    private func destructiveTrashMenuLabel(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "trash")
+                .symbolRenderingMode(.monochrome)
+                .foregroundColor(.red)
+
+            Text(title)
+                .foregroundColor(.red)
+        }
+    }
+
+    @ViewBuilder
+    private func sidebarChatContextMenu(for chat: SavedChat) -> some View {
+        Button {
+            renameDraft = chat.title
+            renameTargetChatID = chat.id
+            showingRenamePrompt = true
+        } label: {
+            Label("Rename Chat", systemImage: "pencil")
+        }
+
+        Button(role: .destructive) {
+            viewModel.deleteChat(id: chat.id)
+        } label: {
+            destructiveTrashMenuLabel("Delete Chat")
+        }
+
+        Menu {
+            if chat.projectID != nil {
+                Button {
+                    viewModel.assignChat(id: chat.id, toProjectID: nil)
+                } label: {
+                    Label("Remove from Project", systemImage: "tray.and.arrow.up")
+                }
+            }
+
+            if viewModel.savedProjects.isEmpty {
+                Button("No Projects Yet") {}
+                    .disabled(true)
+            } else {
+                ForEach(viewModel.savedProjects) { project in
+                    Button {
+                        collapsedHistorySections.remove(projectCollapseKey(project.id))
+                        viewModel.assignChat(id: chat.id, toProjectID: project.id)
+                    } label: {
+                        Label(project.title, systemImage: project.iconSystemName)
+                    }
+                }
+            }
+        } label: {
+            Label("Add to Project", systemImage: "folder.badge.plus")
+        }
+    }
+}
+
+private struct CameraCaptureView: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    let onCapture: (UIImage) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.cameraCaptureMode = .photo
+        picker.allowsEditing = false
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        private let parent: CameraCaptureView
+
+        init(_ parent: CameraCaptureView) {
+            self.parent = parent
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.isPresented = false
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            guard let image = info[.originalImage] as? UIImage else {
+                parent.isPresented = false
+                return
+            }
+
+            parent.isPresented = false
+            parent.onCapture(image)
+        }
+    }
+}
+
+private enum ProjectIconColorOption: String, CaseIterable, Identifiable {
+    case white
+    case red
+    case orange
+    case yellow
+    case green
+    case blue
+    case purple
+    case pink
+
+    var id: String { rawValue }
+
+    var color: Color {
+        switch self {
+        case .white:
+            return .white
+        case .red:
+            return Color(red: 1.0, green: 0.29, blue: 0.26)
+        case .orange:
+            return Color(red: 1.0, green: 0.47, blue: 0.0)
+        case .yellow:
+            return Color(red: 1.0, green: 0.8, blue: 0.0)
+        case .green:
+            return Color(red: 0.0, green: 0.78, blue: 0.35)
+        case .blue:
+            return Color(red: 0.1, green: 0.53, blue: 0.98)
+        case .purple:
+            return Color(red: 0.63, green: 0.32, blue: 0.95)
+        case .pink:
+            return Color(red: 0.96, green: 0.33, blue: 0.73)
+        }
+    }
+}
+
+private struct ProjectSymbolOption: Identifiable, Hashable {
+    let systemName: String
+
+    var id: String { systemName }
+
+    static let all: [ProjectSymbolOption] = [
+        .init(systemName: "folder"),
+        .init(systemName: "dollarsign.circle"),
+        .init(systemName: "book.closed"),
+        .init(systemName: "graduationcap"),
+        .init(systemName: "pencil"),
+        .init(systemName: "signature"),
+        .init(systemName: "curlybraces"),
+        .init(systemName: "terminal"),
+        .init(systemName: "music.note"),
+        .init(systemName: "popcorn"),
+        .init(systemName: "paintbrush.pointed"),
+        .init(systemName: "paintpalette"),
+        .init(systemName: "stethoscope"),
+        .init(systemName: "sparkles"),
+        .init(systemName: "leaf"),
+        .init(systemName: "briefcase"),
+        .init(systemName: "chart.bar"),
+        .init(systemName: "person.2"),
+        .init(systemName: "waveform"),
+        .init(systemName: "checklist"),
+        .init(systemName: "scalemass"),
+        .init(systemName: "microphone"),
+        .init(systemName: "airplane"),
+        .init(systemName: "globe"),
+        .init(systemName: "wrench.and.screwdriver"),
+        .init(systemName: "pawprint"),
+        .init(systemName: "flask"),
+        .init(systemName: "brain"),
+        .init(systemName: "heart"),
+        .init(systemName: "gift")
+    ]
+}
+
+private struct NewProjectSheet: View {
+    let accentColor: Color
+    let onCreate: (String, String, String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var nameFocused: Bool
+    @State private var projectName = ""
+    @State private var selectedSymbol = "folder"
+    @State private var selectedColor = ProjectIconColorOption.white
+    @State private var showingIconPicker = false
+
+    private var canCreate: Bool {
+        !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack {
+                Text("New Project")
+                    .font(.title2.weight(.bold))
+
+                Spacer()
+
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.headline.weight(.bold))
+                        .frame(width: 40, height: 40)
+                        .background(
+                            Circle()
+                                .fill(Color(.tertiarySystemFill))
+                        )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .accessibilityLabel("Close")
+            }
+
+            Text("Create a project folder to keep related chats together.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 14) {
+                Button {
+                    showingIconPicker = true
+                } label: {
+                    Image(systemName: selectedSymbol)
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(selectedColor.color)
+                        .frame(width: 44, height: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color(.tertiarySystemFill))
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Choose project icon")
+
+                TextField("Project name", text: $projectName)
+                    .textFieldStyle(.plain)
+                    .font(.title3.weight(.medium))
+                    .focused($nameFocused)
+                    .textInputAutocapitalization(.words)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color(.tertiarySystemFill))
+            )
+
+            Button {
+                onCreate(
+                    projectName.trimmingCharacters(in: .whitespacesAndNewlines),
+                    selectedSymbol,
+                    selectedColor.rawValue
+                )
+                dismiss()
+            } label: {
+                Text("Create Project")
+                    .font(.headline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(canCreate ? accentColor : Color(.systemGray4))
+                    )
+                    .foregroundStyle(canCreate ? Color.white : Color(.secondaryLabel))
+            }
+            .buttonStyle(.plain)
+            .disabled(!canCreate)
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .presentationDetents([.height(320)])
+        .presentationCornerRadius(30)
+        .presentationDragIndicator(.hidden)
+        .presentationBackground(Color(.secondarySystemBackground))
+        .sheet(isPresented: $showingIconPicker) {
+            ProjectIconPickerSheet(
+                selectedSymbol: $selectedSymbol,
+                selectedColor: $selectedColor
+            )
+        }
+        .onAppear {
+            Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                nameFocused = true
+            }
+        }
+    }
+}
+
+private struct EditProjectSheet: View {
+    let project: SavedProject
+    let projectChats: [SavedChat]
+    let accentColor: Color
+    let onSave: (String, String, String) -> Void
+    let onRemoveChat: (UUID) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var nameFocused: Bool
+    @State private var projectName: String
+    @State private var selectedSymbol: String
+    @State private var selectedColor: ProjectIconColorOption
+    @State private var showingIconPicker = false
+
+    init(
+        project: SavedProject,
+        projectChats: [SavedChat],
+        accentColor: Color,
+        onSave: @escaping (String, String, String) -> Void,
+        onRemoveChat: @escaping (UUID) -> Void
+    ) {
+        self.project = project
+        self.projectChats = projectChats
+        self.accentColor = accentColor
+        self.onSave = onSave
+        self.onRemoveChat = onRemoveChat
+        _projectName = State(initialValue: project.title)
+        _selectedSymbol = State(initialValue: project.iconSystemName)
+        _selectedColor = State(
+            initialValue: ProjectIconColorOption(rawValue: project.iconColorName) ?? .white
+        )
+    }
+
+    private var canSave: Bool {
+        !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack {
+                        Text("Edit Project")
+                            .font(.title2.weight(.bold))
+
+                        Spacer()
+
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.headline.weight(.bold))
+                                .frame(width: 40, height: 40)
+                                .background(
+                                    Circle()
+                                        .fill(Color(.tertiarySystemFill))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.primary)
+                        .accessibilityLabel("Close")
+                    }
+
+                    HStack(spacing: 14) {
+                        Button {
+                            showingIconPicker = true
+                        } label: {
+                            Image(systemName: selectedSymbol)
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(selectedColor.color)
+                                .frame(width: 44, height: 44)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(Color(.tertiarySystemFill))
+                                )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Choose project icon")
+
+                    TextField("Project name", text: $projectName)
+                        .textFieldStyle(.plain)
+                        .font(.title3.weight(.medium))
+                            .focused($nameFocused)
+                            .textInputAutocapitalization(.words)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .fill(Color(.tertiarySystemFill))
+                    )
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Chats in Project")
+                            .font(.headline.weight(.semibold))
+
+                        if projectChats.isEmpty {
+                            Text("No chats in this project.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 8)
+                        } else {
+                            ForEach(projectChats) { chat in
+                                HStack(spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(chat.title)
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+
+                                        Text(historyTimeFormatter.string(from: chat.updatedAt))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    Button {
+                                        onRemoveChat(chat.id)
+                                    } label: {
+                                        Text("Remove")
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 8)
+                                            .background(
+                                                Capsule(style: .continuous)
+                                                    .fill(Color(.tertiarySystemFill))
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.primary)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 12)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(Color(.secondarySystemBackground))
+                                )
+                            }
+                        }
+                    }
+
+                    Button {
+                        onSave(
+                            projectName.trimmingCharacters(in: .whitespacesAndNewlines),
+                            selectedSymbol,
+                            selectedColor.rawValue
+                        )
+                        dismiss()
+                    } label: {
+                        Text("Save Changes")
+                            .font(.headline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(canSave ? accentColor : Color(.systemGray4))
+                            )
+                            .foregroundStyle(canSave ? Color.white : Color(.secondaryLabel))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canSave)
+                }
+                .padding(24)
+            }
+            .presentationDetents([.medium, .large])
+            .presentationCornerRadius(30)
+            .presentationDragIndicator(.visible)
+            .presentationBackground(Color(.secondarySystemBackground))
+            .sheet(isPresented: $showingIconPicker) {
+                ProjectIconPickerSheet(
+                    selectedSymbol: $selectedSymbol,
+                    selectedColor: $selectedColor
+                )
+            }
+            .onAppear {
+                Task {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    nameFocused = true
+                }
+            }
+        }
+    }
+}
+
+private struct ProjectIconPickerSheet: View {
+    @Binding var selectedSymbol: String
+    @Binding var selectedColor: ProjectIconColorOption
+    @Environment(\.dismiss) private var dismiss
+
+    private let gridColumns = Array(repeating: GridItem(.flexible(), spacing: 18), count: 5)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HStack {
+                Text("Choose Icon")
+                    .font(.title3.weight(.bold))
+
+                Spacer()
+
+                Button("Done") {
+                    dismiss()
+                }
+                .font(.headline.weight(.semibold))
+            }
+
+            HStack {
+                Spacer()
+
+                Image(systemName: selectedSymbol)
+                    .font(.system(size: 54, weight: .regular))
+                    .foregroundStyle(selectedColor.color)
+                    .frame(width: 108, height: 108)
+                    .background(
+                        RoundedRectangle(cornerRadius: 28, style: .continuous)
+                            .fill(Color(.tertiarySystemFill))
+                    )
+
+                Spacer()
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(ProjectIconColorOption.allCases) { colorOption in
+                        Button {
+                            selectedColor = colorOption
+                        } label: {
+                            Circle()
+                                .fill(colorOption.color)
+                                .overlay {
+                                    Circle()
+                                        .stroke(
+                                            Color.white.opacity(colorOption == .white ? 0.16 : 0),
+                                            lineWidth: 2
+                                        )
+                                }
+                                .overlay {
+                                    Circle()
+                                        .stroke(
+                                            colorOption == selectedColor ? Color.primary : Color.clear,
+                                            lineWidth: 3
+                                        )
+                                        .padding(2)
+                                }
+                                .frame(width: 38, height: 38)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            Divider()
+
+            ScrollView {
+                LazyVGrid(columns: gridColumns, spacing: 18) {
+                    ForEach(ProjectSymbolOption.all) { option in
+                        Button {
+                            selectedSymbol = option.systemName
+                        } label: {
+                            Image(systemName: option.systemName)
+                                .font(.system(size: 24, weight: .regular))
+                                .foregroundStyle(selectedColor.color)
+                                .frame(maxWidth: .infinity, minHeight: 52)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                        .fill(
+                                            selectedSymbol == option.systemName
+                                                ? Color(.tertiarySystemFill)
+                                                : Color.clear
+                                        )
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                        .stroke(
+                                            selectedSymbol == option.systemName
+                                                ? Color.primary.opacity(0.2)
+                                                : Color.clear,
+                                            lineWidth: 1
+                                        )
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.bottom, 12)
+            }
+        }
+        .padding(24)
+        .presentationDetents([.height(520)])
+        .presentationCornerRadius(32)
+        .presentationBackground(Color(.secondarySystemBackground))
+    }
+}
+
+private struct SidebarProjectDropDelegate: DropDelegate {
+    let projectID: UUID
+    @Binding var hoveredProjectDropID: UUID?
+    @Binding var collapsedHistorySections: Set<String>
+    let collapseKey: String
+    let onAssignChat: (UUID, UUID?) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [UTType.text.identifier])
+    }
+
+    func dropEntered(info: DropInfo) {
+        hoveredProjectDropID = projectID
+        collapsedHistorySections.remove(collapseKey)
+    }
+
+    func dropExited(info: DropInfo) {
+        if hoveredProjectDropID == projectID {
+            hoveredProjectDropID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        hoveredProjectDropID = nil
+
+        guard let provider = info.itemProviders(for: [UTType.text.identifier]).first else {
+            return false
+        }
+
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let string = object as? String,
+                  let chatID = UUID(uuidString: string) else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                onAssignChat(chatID, projectID)
+            }
+        }
+
+        return true
     }
 }
 
@@ -862,6 +1933,400 @@ private let historyTimeFormatter: DateFormatter = {
     return formatter
 }()
 
+@ViewBuilder
+private func imageAttachmentThumbnail(_ attachment: ChatImageAttachment, size: CGSize) -> some View {
+    if let image = attachment.previewImage {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: size.width, height: size.height)
+    } else {
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .fill(Color(.tertiarySystemFill))
+            .overlay {
+                Image(systemName: "photo")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: size.width, height: size.height)
+    }
+}
+
+private struct AssistantTypingIndicator: View {
+    private let dotCount = 3
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { context in
+            let now = context.date.timeIntervalSinceReferenceDate
+
+            HStack(spacing: 6) {
+                ForEach(0..<dotCount, id: \.self) { index in
+                    let intensity = dotIntensity(for: index, time: now)
+
+                    Circle()
+                        .fill(Color.secondary)
+                        .frame(width: 7, height: 7)
+                        .scaleEffect(0.82 + (0.3 * intensity))
+                        .opacity(0.3 + (0.7 * intensity))
+                }
+            }
+            .frame(minWidth: 30, alignment: .leading)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Assistant is thinking")
+    }
+
+    private func dotIntensity(for index: Int, time: TimeInterval) -> Double {
+        let speed = 1.8
+        let phase = time * speed - (Double(index) * 0.18)
+        return (sin(phase * .pi * 2) + 1) / 2
+    }
+}
+
+private struct AssistantMessageContent: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(contentBlocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .markdown(let markdownText):
+                    AssistantMarkdownText(text: markdownText)
+                case .code(let language, let code):
+                    AssistantCodeBlock(language: language, code: code)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var contentBlocks: [ContentBlock] {
+        parseContentBlocks(from: text)
+    }
+
+    private func parseContentBlocks(from rawText: String) -> [ContentBlock] {
+        let normalized = rawText.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+
+        var blocks: [ContentBlock] = []
+        var textBuffer: [String] = []
+        var codeBuffer: [String] = []
+        var codeLanguage: String?
+        var isInsideCodeFence = false
+
+        func flushTextBuffer() {
+            let joined = textBuffer.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty {
+                blocks.append(.markdown(joined))
+            }
+            textBuffer.removeAll(keepingCapacity: true)
+        }
+
+        func flushCodeBuffer() {
+            let joined = codeBuffer.joined(separator: "\n").trimmingCharacters(in: .newlines)
+            blocks.append(.code(language: codeLanguage, code: joined))
+            codeBuffer.removeAll(keepingCapacity: true)
+        }
+
+        for line in lines {
+            if line.hasPrefix("```") {
+                if isInsideCodeFence {
+                    flushCodeBuffer()
+                    isInsideCodeFence = false
+                    codeLanguage = nil
+                } else {
+                    flushTextBuffer()
+                    isInsideCodeFence = true
+
+                    let language = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    codeLanguage = language.isEmpty ? nil : language
+                }
+
+                continue
+            }
+
+            if isInsideCodeFence {
+                codeBuffer.append(line)
+            } else {
+                textBuffer.append(line)
+            }
+        }
+
+        if isInsideCodeFence {
+            flushCodeBuffer()
+        } else {
+            flushTextBuffer()
+        }
+
+        return blocks.isEmpty ? [.markdown(normalized)] : blocks
+    }
+
+    private enum ContentBlock {
+        case markdown(String)
+        case code(language: String?, code: String)
+    }
+}
+
+private struct AssistantMarkdownText: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .paragraph(let paragraph):
+                    inlineMarkdownText(paragraph)
+                case .heading(let level, let heading):
+                    inlineMarkdownText(heading)
+                        .font(headingFont(for: level))
+                        .fontWeight(.semibold)
+                case .unorderedList(let items):
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text("•")
+                                inlineMarkdownText(item)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                case .orderedList(let items):
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text("\(item.number).")
+                                    .monospacedDigit()
+                                inlineMarkdownText(item.text)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                case .separator:
+                    EmptyView()
+                }
+            }
+        }
+        .lineSpacing(4)
+        .multilineTextAlignment(.leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var blocks: [MarkdownBlock] {
+        let lines = normalizedText.components(separatedBy: "\n")
+
+        var parsedBlocks: [MarkdownBlock] = []
+        var paragraphBuffer: [String] = []
+        var unorderedItems: [String] = []
+        var orderedItems: [OrderedListItem] = []
+
+        func flushParagraph() {
+            let paragraph = paragraphBuffer
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if !paragraph.isEmpty {
+                parsedBlocks.append(.paragraph(paragraph))
+            }
+
+            paragraphBuffer.removeAll(keepingCapacity: true)
+        }
+
+        func flushUnorderedList() {
+            guard !unorderedItems.isEmpty else { return }
+            parsedBlocks.append(.unorderedList(unorderedItems))
+            unorderedItems.removeAll(keepingCapacity: true)
+        }
+
+        func flushOrderedList() {
+            guard !orderedItems.isEmpty else { return }
+            parsedBlocks.append(.orderedList(orderedItems))
+            orderedItems.removeAll(keepingCapacity: true)
+        }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.isEmpty {
+                flushParagraph()
+                flushUnorderedList()
+                flushOrderedList()
+                continue
+            }
+
+            if trimmed.range(of: #"^---+$"#, options: .regularExpression) != nil {
+                flushParagraph()
+                flushUnorderedList()
+                flushOrderedList()
+                parsedBlocks.append(.separator)
+                continue
+            }
+
+            if let heading = headingMatch(in: trimmed) {
+                flushParagraph()
+                flushUnorderedList()
+                flushOrderedList()
+                parsedBlocks.append(.heading(level: heading.level, text: heading.text))
+                continue
+            }
+
+            if let unorderedItem = unorderedListItem(in: trimmed) {
+                flushParagraph()
+                flushOrderedList()
+                unorderedItems.append(unorderedItem)
+                continue
+            }
+
+            if let orderedItem = orderedListItem(in: trimmed) {
+                flushParagraph()
+                flushUnorderedList()
+                orderedItems.append(orderedItem)
+                continue
+            }
+
+            flushUnorderedList()
+            flushOrderedList()
+            paragraphBuffer.append(trimmed)
+        }
+
+        flushParagraph()
+        flushUnorderedList()
+        flushOrderedList()
+
+        return parsedBlocks
+    }
+
+    private var normalizedText: String {
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private func inlineMarkdownText(_ text: String) -> some View {
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(
+                interpretedSyntax: .full,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        ) {
+            Text(attributed)
+        } else {
+            Text(verbatim: text)
+        }
+    }
+
+    private func headingFont(for level: Int) -> Font {
+        switch level {
+        case 1:
+            return .title2
+        case 2:
+            return .title3
+        default:
+            return .headline
+        }
+    }
+
+    private func headingMatch(in line: String) -> (level: Int, text: String)? {
+        guard line.hasPrefix("#") else { return nil }
+
+        let hashes = line.prefix { $0 == "#" }
+        let textStart = line.index(line.startIndex, offsetBy: hashes.count)
+        let headingText = line[textStart...].trimmingCharacters(in: .whitespaces)
+
+        guard !headingText.isEmpty else { return nil }
+        return (level: hashes.count, text: headingText)
+    }
+
+    private func unorderedListItem(in line: String) -> String? {
+        guard ["- ", "* ", "+ "].contains(where: { line.hasPrefix($0) }) else { return nil }
+        return String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+    }
+
+    private func orderedListItem(in line: String) -> OrderedListItem? {
+        guard let dotIndex = line.firstIndex(of: ".") else { return nil }
+
+        let numberPart = line[..<dotIndex]
+        guard let number = Int(numberPart) else { return nil }
+
+        let textStart = line.index(after: dotIndex)
+        let itemText = line[textStart...].trimmingCharacters(in: .whitespaces)
+        guard !itemText.isEmpty else { return nil }
+
+        return OrderedListItem(number: number, text: itemText)
+    }
+
+    private enum MarkdownBlock {
+        case paragraph(String)
+        case heading(level: Int, text: String)
+        case unorderedList([String])
+        case orderedList([OrderedListItem])
+        case separator
+    }
+
+    private struct OrderedListItem {
+        let number: Int
+        let text: String
+    }
+}
+
+private struct AssistantCodeBlock: View {
+    let language: String?
+    let code: String
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                if let language, !language.isEmpty {
+                    Text(language)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.lowercase)
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    UIPasteboard.general.string = code
+                    copied = true
+
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.2))
+                        copied = false
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        Text(copied ? "Copied" : "Copy")
+                    }
+                    .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(copied ? .green : .secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(.tertiarySystemBackground))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(verbatim: code)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .textSelection(.enabled)
+            }
+            .background(Color(.secondarySystemBackground))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
 private struct MessageBubble: View {
     let message: ChatMessage
     let onCopyUserMessage: () -> Void
@@ -874,103 +2339,76 @@ private struct MessageBubble: View {
         HStack {
             if message.role == .assistant {
                 VStack(alignment: .leading, spacing: 6) {
-                    bubble
+                    assistantContent
                     assistantActions
                 }
                 Spacer(minLength: 50)
             } else {
                 Spacer(minLength: 50)
-                bubble
+                userBubble
             }
         }
     }
 
-    private var bubble: some View {
-        Group {
-            if message.role == .assistant {
-                renderedAssistantText
-            } else {
-                Text(message.text.isEmpty ? "…" : message.text)
-            }
-        }
+    private var assistantContent: some View {
+        renderedAssistantText
+            .textSelection(.enabled)
+            .foregroundStyle(Color.primary)
+    }
+
+    private var userBubble: some View {
+        userMessageContent
             .textSelection(.enabled)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(message.role == .assistant ? Color(.secondarySystemBackground) : accentColor)
+                    .fill(accentColor)
             )
-            .foregroundStyle(message.role == .assistant ? Color.primary : Color.white)
+            .foregroundStyle(Color.white)
             .contextMenu {
-                if message.role == .user {
-                    Button {
-                        onCopyUserMessage()
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
+                Button {
+                    onCopyUserMessage()
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
 
-                    Button {
-                        onEditUserMessage()
-                    } label: {
-                        Label("Edit", systemImage: "pencil")
+                Button {
+                    onEditUserMessage()
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var userMessageContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !message.imageAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(message.imageAttachments) { attachment in
+                            imageAttachmentThumbnail(attachment, size: CGSize(width: 140, height: 140))
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        }
                     }
                 }
             }
+
+            if !message.text.isEmpty || message.imageAttachments.isEmpty {
+                Text(message.text.isEmpty ? "…" : message.text)
+            }
+        }
     }
 
     private var renderedAssistantText: some View {
         Group {
             if message.text.isEmpty {
-                Text("…")
+                AssistantTypingIndicator()
             } else {
-                Text(verbatim: displayAssistantText)
-                    .lineSpacing(4)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                AssistantMessageContent(text: message.text)
             }
         }
-    }
-
-    private var displayAssistantText: String {
-        message.text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(
-                of: #"(?m)^\s*---+\s*$"#,
-                with: "",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"(?m)^#{1,6}\s*(.+)$"#,
-                with: "$1",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"\*\*(.*?)\*\*"#,
-                with: "$1",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"__(.*?)__"#,
-                with: "$1",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"(?m)^-\s+"#,
-                with: "• ",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"`([^`]*)`"#,
-                with: "$1",
-                options: .regularExpression
-            )
-            .replacingOccurrences(of: "  \n", with: "\n")
-            .replacingOccurrences(
-                of: #"\n{3,}"#,
-                with: "\n\n",
-                options: .regularExpression
-            )
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @ViewBuilder
@@ -1010,6 +2448,18 @@ private struct MessageBubble: View {
     }
 }
 
+private extension ChatImageAttachment {
+    var previewImage: UIImage? {
+        guard let separatorIndex = dataURL.firstIndex(of: ",") else { return nil }
+        let encodedData = String(dataURL[dataURL.index(after: separatorIndex)...])
+        guard let imageData = Data(base64Encoded: encodedData, options: .ignoreUnknownCharacters) else {
+            return nil
+        }
+
+        return UIImage(data: imageData)
+    }
+}
+
 private struct SettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
     @Binding var personalityPreset: String
@@ -1033,7 +2483,7 @@ private struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 28) {
                     VStack(alignment: .leading, spacing: 14) {
                         Text("Theme")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
 
                         settingsCard {
                             Menu {
@@ -1090,7 +2540,7 @@ private struct SettingsView: View {
 
                     VStack(alignment: .leading, spacing: 14) {
                         Text("Assistant")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
 
                         settingsCard {
                             Menu {
@@ -1124,7 +2574,8 @@ private struct SettingsView: View {
                                         .foregroundStyle(.secondary)
 
                                     TextEditor(text: $customPersonalityInstructions)
-                                        .frame(minHeight: 110)
+                                        .font(.subheadline)
+                                        .frame(minHeight: 96)
                                         .scrollContentBackground(.hidden)
                                         .padding(10)
                                         .background(
@@ -1141,7 +2592,7 @@ private struct SettingsView: View {
 
                     VStack(alignment: .leading, spacing: 14) {
                         Text("Identity")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
 
                         settingsCard {
                             VStack(spacing: 0) {
@@ -1154,10 +2605,11 @@ private struct SettingsView: View {
                                 settingsTextField("User ID", text: $viewModel.userId)
                                 settingsDivider
                                 SecureField("API Token (optional)", text: $viewModel.apiToken)
+                                    .font(.subheadline)
                                     .textInputAutocapitalization(.never)
                                     .autocorrectionDisabled()
                                     .padding(.horizontal, 18)
-                                    .padding(.vertical, 16)
+                                    .padding(.vertical, 14)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -1169,8 +2621,8 @@ private struct SettingsView: View {
 
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 24)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 20)
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -1214,11 +2666,12 @@ private struct SettingsView: View {
         keyboardType: UIKeyboardType = .default
     ) -> some View {
         TextField(title, text: text)
+            .font(.subheadline)
             .keyboardType(keyboardType)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
             .padding(.horizontal, 18)
-            .padding(.vertical, 16)
+            .padding(.vertical, 14)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -1228,13 +2681,15 @@ private struct SettingsView: View {
         trailingText: String,
         trailingColor: Color? = nil
     ) -> some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             Image(systemName: icon)
-                .font(.system(size: 22, weight: .regular))
-                .frame(width: 28)
+                .font(.system(size: 19, weight: .regular))
+                .frame(width: 24)
 
             Text(title)
-                .font(.title3)
+                .font(.body.weight(.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
 
             Spacer(minLength: 12)
 
@@ -1245,15 +2700,17 @@ private struct SettingsView: View {
             }
 
             Text(trailingText)
-                .font(.title3)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
                 .foregroundStyle(.secondary)
 
             Image(systemName: "chevron.up.chevron.down")
-                .font(.subheadline.weight(.semibold))
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 18)
+        .padding(.vertical, 15)
         .contentShape(Rectangle())
     }
 }

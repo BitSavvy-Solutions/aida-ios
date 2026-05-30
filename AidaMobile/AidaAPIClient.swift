@@ -3,6 +3,7 @@ import Foundation
 struct AidaMessagePayload: Encodable {
     let type: String
     let content: String
+    let image_data_urls: [String]?
 }
 
 struct AidaChatPayload: Encodable {
@@ -12,6 +13,7 @@ struct AidaChatPayload: Encodable {
     let language: String
     let model: String
     let user_id: String?
+    let image_data_urls: [String]?
     let web_search_enabled: Bool?
     let webSearchEnabled: Bool?
 }
